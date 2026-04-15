@@ -1,0 +1,14 @@
+{
+  "store_path": "D:/ai_journal/store",
+  "window_opacity": 0.95,
+  "auto_refresh": true,
+  "refresh_interval": 2,
+  "window_position": {
+    "x": null,
+    "y": null
+  },
+  "window_size": {
+    "width": 400,
+    "height": 600
+  }
+}

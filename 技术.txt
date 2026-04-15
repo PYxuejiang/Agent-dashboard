@@ -1,0 +1,732 @@
+AI Journal Dashboard 完整技术说明
+
+═══════════════════════════════════════════════════════════════════════════════
+一、项目架构
+═══════════════════════════════════════════════════════════════════════════════
+
+【整体架构】
+MCP Agent → mcp_logger.py → Dai_journalstore → watchdog → parser.py → UI 组件
+
+【技术栈】
+- 语言：Python 3.10+
+- GUI 框架：PySide6 (Qt for Python)
+- 文件监听：watchdog
+- 数据格式：JSONL (JSON Lines)
+- 样式：Catppuccin Mocha 配色
+
+【目录结构】
+D:/PyCharm_AI/
+├── app.py                          # 主程序入口
+├── config.json                     # 配置文件
+├── requirements.txt                # 依赖清单
+├── Dai_journal/                    # MCP 日志模块
+│   └── mcp_logger.py
+├── Dai_journalstore/               # 日志存储（按项目/日期/聊天组织）
+└── dashboard/                      # 桌面组件
+    ├── parser.py                   # 日志解析器
+    ├── watcher.py                  # 文件监听器
+    └── ui/                         # UI 组件
+        ├── main_widget.py          # 主悬浮窗
+        ├── detail_dialog.py        # 详情对话框
+        └── summary_widget.py       # 7天汇总视图
+
+
+═══════════════════════════════════════════════════════════════════════════════
+二、核心技术实现
+═══════════════════════════════════════════════════════════════════════════════
+
+【1】PySide6 窗口系统
+────────────────────────────────────────────────────────────────────────────
+
+技术点：无边框窗口 + 透明背景 + 置顶显示
+
+实现：
+```python
+self.setWindowFlags(
+    Qt.FramelessWindowHint |      # 无边框，自定义标题栏
+    Qt.WindowStaysOnTopHint |     # 始终置顶
+    Qt.Tool                       # 工具窗口，不在任务栏显示
+)
+self.setAttribute(Qt.WA_TranslucentBackground)  # 透明背景
+self.setWindowOpacity(0.95)                     # 整体透明度
+```
+
+优势：
+- 完全自定义 UI，不受系统窗口样式限制
+- 透明背景实现圆角和阴影效果
+- 置顶确保日志信息始终可见
+
+
+【2】拖拽移动实现
+────────────────────────────────────────────────────────────────────────────
+
+技术点：鼠标事件捕获 + 全局坐标计算
+
+实现：
+```python
+def mousePressEvent(self, event):
+    if event.button() == Qt.LeftButton:
+        # 记录鼠标相对窗口的偏移
+        self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+def mouseMoveEvent(self, event):
+    if self._drag_pos and event.buttons() == Qt.LeftButton:
+        # 根据偏移移动窗口
+        self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+def mouseReleaseEvent(self, event):
+    self._drag_pos = None
+```
+
+关键：
+- globalPosition() 获取屏幕绝对坐标
+- frameGeometry().topLeft() 获取窗口左上角坐标
+- 偏移量 = 鼠标全局坐标 - 窗口坐标
+
+
+【3】右下角拖拽缩放
+────────────────────────────────────────────────────────────────────────────
+
+技术点：热区检测 + 动态 resize
+
+实现：
+```python
+_RESIZE_MARGIN = 8  # 热区大小
+
+def _in_resize_zone(self, pos: QPoint) -> bool:
+    # 判断鼠标是否在右下角 16x16 区域
+    return (pos.x() >= self.width() - _RESIZE_MARGIN * 2 and
+            pos.y() >= self.height() - _RESIZE_MARGIN * 2)
+
+def mousePressEvent(self, event):
+    if self._in_resize_zone(event.position().toPoint()):
+        self._resizing = True
+        self._resize_start = event.globalPosition().toPoint()
+        self._resize_size = QSize(self.width(), self.height())
+
+def mouseMoveEvent(self, event):
+    if self._resizing:
+        delta = event.globalPosition().toPoint() - self._resize_start
+        self.resize(
+            max(250, self._resize_size.width() + delta.x()),
+            max(200, self._resize_size.height() + delta.y())
+        )
+```
+
+优化：
+- 限制最小尺寸防止窗口过小
+- 鼠标进入热区时显示 SizeFDiagCursor 光标提示
+- 使用 setMouseTracking(True) 实时更新光标
+
+
+【4】小悬浮图标
+────────────────────────────────────────────────────────────────────────────
+
+技术点：独立 QWidget + 点击/拖拽区分
+
+实现：
+```python
+class FloatIcon(QWidget):
+    def __init__(self, panel: "MainWidget"):
+        self.panel = panel
+        self.setFixedSize(48, 48)
+        lbl = QLabel("📓", self)  # 使用 emoji 作为图标
+
+    def mouseReleaseEvent(self, event):
+        # 判断是点击还是拖拽
+        moved = (event.globalPosition().toPoint() - self.frameGeometry().topLeft()) != self._drag_pos
+        if not moved:
+            # 点击：切换面板显示
+            if self.panel.isVisible():
+                self.panel.hide()
+            else:
+                # 面板出现在图标旁边
+                geo = self.frameGeometry()
+                self.panel.move(geo.right() + 8, geo.top())
+                self.panel.show()
+```
+
+关键：
+- 独立窗口，与主面板解耦
+- 通过位置变化判断是点击还是拖拽
+- 面板位置根据图标位置动态计算
+
+
+【5】系统托盘集成
+────────────────────────────────────────────────────────────────────────────
+
+技术点：QSystemTrayIcon + 动态绘制图标
+
+实现：
+```python
+def _create_tray_icon() -> QIcon:
+    pixmap = QPixmap(16, 16)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)  # 抗锯齿
+    painter.setBrush(QColor("#cba6f7"))           # 紫色
+    painter.setPen(Qt.NoPen)                      # 无边框
+    painter.drawEllipse(1, 1, 14, 14)             # 画圆
+    painter.end()
+    return QIcon(pixmap)
+
+tray = QSystemTrayIcon(app)
+tray.setIcon(_create_tray_icon())
+tray.setContextMenu(menu)  # 右键菜单
+```
+
+优势：
+- 程序最小化后常驻托盘
+- 右键菜单快速操作
+- 自定义图标，无需外部文件
+
+
+【6】日期导航栏 + StackedWidget
+────────────────────────────────────────────────────────────────────────────
+
+技术点：QStackedWidget 多页面切换
+
+实现：
+```python
+self.stacked = QStackedWidget()
+self.stacked.addWidget(self.today_scroll)      # 索引 0
+self.stacked.addWidget(self.yesterday_scroll)  # 索引 1
+self.stacked.addWidget(self.week_widget)       # 索引 2
+
+def _switch_mode(self, mode: str):
+    if mode == "today":
+        self.stacked.setCurrentIndex(0)
+    elif mode == "yesterday":
+        self.stacked.setCurrentIndex(1)
+    elif mode == "7day":
+        self.stacked.setCurrentIndex(2)
+
+    self.date_mode_changed.emit(mode)  # 发射信号
+```
+
+优势：
+- 无缝切换，无闪烁
+- 每个页面独立滚动状态
+- 信号槽机制解耦视图和数据
+
+
+【7】文件监听 (watchdog)
+────────────────────────────────────────────────────────────────────────────
+
+技术点：Observer 模式 + 递归监听
+
+实现：
+```python
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+class _LogChangeHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.src_path.endswith((".jsonl", ".md")):
+            self.callback()
+
+    def on_modified(self, event):
+        if event.src_path.endswith((".jsonl", ".md")):
+            self.callback()
+
+observer = Observer()
+observer.schedule(handler, store_path, recursive=True)
+observer.start()
+```
+
+优势：
+- 实时响应文件变化，无需轮询
+- 递归监听子目录
+- 跨平台支持（Windows/Linux/macOS）
+
+
+【8】JSONL 日志解析
+────────────────────────────────────────────────────────────────────────────
+
+技术点：逐行解析 + 事件类型提取
+
+实现：
+```python
+def _read_jsonl(path: Path) -> List[Dict]:
+    events = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+    return events
+
+# 提取关键信息
+for ev in events:
+    t = ev.get("type")
+    payload = ev.get("payload", {})
+
+    if t == "prompt":
+        project_purpose = payload.get("abstract_task")
+    elif t == "command":
+        cmd = payload.get("command")
+        purpose = payload.get("purpose")
+    elif t == "issue":
+        diagnosis = payload.get("diagnosis")
+        status = payload.get("status")
+```
+
+优势：
+- JSONL 格式支持追加写入，无需重写整个文件
+- 逐行解析，内存占用低
+- 结构化数据，易于查询和聚合
+
+
+【9】数据聚合与统计
+────────────────────────────────────────────────────────────────────────────
+
+技术点：Counter 统计 + 多日期遍历
+
+实现：
+```python
+from collections import Counter
+
+# 统计里程碑出现次数
+all_milestones = []
+for ev in events:
+    milestone = ev.get("milestone")
+    if milestone:
+        all_milestones.append(milestone)
+
+milestone_stats = Counter(all_milestones).most_common(10)
+
+# 7天数据聚合
+dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+for date_str in dates:
+    date_dir = project_dir / date_str
+    # 遍历并聚合
+```
+
+优势：
+- Counter 高效统计频次
+- 时间范围灵活可配
+- 支持多维度聚合（项目、日期、标签）
+
+
+【10】信号槽机制
+────────────────────────────────────────────────────────────────────────────
+
+技术点：Qt Signal/Slot 解耦
+
+实现：
+```python
+class MainWidget(QWidget):
+    project_selected = Signal(dict)      # 自定义信号
+    date_mode_changed = Signal(str)
+
+    def _on_card_clicked(self, data):
+        self.project_selected.emit(data)  # 发射信号
+
+# 连接信号
+widget.project_selected.connect(
+    lambda data: DetailDialog(data, widget).exec()
+)
+widget.date_mode_changed.connect(on_mode_changed)
+```
+
+优势：
+- 组件间松耦合
+- 一对多通知
+- 类型安全（Signal 可指定参数类型）
+
+
+【11】定时刷新
+────────────────────────────────────────────────────────────────────────────
+
+技术点：QTimer + 可配置间隔
+
+实现：
+```python
+interval = config.get("refresh_interval", 2) * 1000  # 秒转毫秒
+timer = QTimer()
+timer.timeout.connect(refresh_callback)
+timer.start(interval)
+```
+
+优势：
+- 非阻塞，不影响 UI 响应
+- 间隔可配置
+- 可随时 stop/start
+
+
+【12】样式系统
+────────────────────────────────────────────────────────────────────────────
+
+技术点：QSS (Qt Style Sheets) + Catppuccin 配色
+
+实现：
+```python
+self.setStyleSheet("""
+    ProjectCard {
+        background: #1e1e2e;
+        border: 1px solid #313244;
+        border-radius: 6px;
+    }
+    ProjectCard:hover {
+        border-color: #89b4fa;
+    }
+""")
+```
+
+配色方案：
+- 背景：#181825 (深色)
+- 卡片：#1e1e2e
+- 边框：#313244
+- 文本：#cdd6f4
+- 强调色：紫 #cba6f7、蓝 #89b4fa、绿 #a6e3a1、青 #89dceb
+
+优势：
+- CSS-like 语法，易于维护
+- 支持伪类（:hover, :pressed）
+- 主题统一，视觉一致
+
+
+【13】跨平台文件打开
+────────────────────────────────────────────────────────────────────────────
+
+技术点：平台检测 + 系统调用
+
+实现：
+```python
+import sys, os, subprocess
+
+def _open_file(self, path: str):
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", path])
+    else:
+        subprocess.run(["xdg-open", path])
+```
+
+支持：
+- Windows: os.startfile()
+- macOS: open 命令
+- Linux: xdg-open
+
+
+【14】配置管理
+────────────────────────────────────────────────────────────────────────────
+
+技术点：JSON 配置文件 + 默认值
+
+实现：
+```python
+def load_config() -> dict:
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+store_path = config.get("store_path", "./Dai_journalstore")
+```
+
+配置项：
+- store_path: 日志目录
+- window_opacity: 窗口透明度
+- refresh_interval: 刷新间隔
+- window_size: 窗口大小
+- window_position: 窗口位置
+
+
+═══════════════════════════════════════════════════════════════════════════════
+三、数据流与生命周期
+═══════════════════════════════════════════════════════════════════════════════
+
+【数据流】
+1. MCP Agent 工作 → 调用 mcp_logger.py
+2. mcp_logger.py → 写入 JSONL 到 Dai_journalstore/[项目]/[日期]/[聊天].jsonl
+3. watchdog 检测到文件变化 → 触发回调
+4. parser.py 读取 JSONL → 解析事件 → 提取关键信息
+5. UI 组件接收数据 → 更新显示
+
+【应用生命周期】
+1. 启动：
+   - 加载配置
+   - 创建主窗口（隐藏）
+   - 创建小图标（显示）
+   - 启动文件监听
+   - 启动定时器
+   - 初始数据加载
+
+2. 运行：
+   - 文件变化 → 自动刷新
+   - 定时器触发 → 定期刷新
+   - 用户交互 → 切换视图、查看详情
+
+3. 退出：
+   - 停止文件监听
+   - 停止定时器
+   - 清理资源
+
+
+═══════════════════════════════════════════════════════════════════════════════
+四、性能优化技术
+═══════════════════════════════════════════════════════════════════════════════
+
+【1】懒加载
+- 只解析当前视图需要的日期数据
+- 卡片内容按需渲染
+
+【2】增量更新
+- 文件变化时只刷新当前视图
+- 避免全量重新解析
+
+【3】内存优化
+- JSONL 逐行解析，不一次性加载全文件
+- 只保留最近 N 条记录（可配置）
+
+【4】UI 优化
+- QScrollArea 虚拟滚动
+- 卡片复用，减少 widget 创建
+
+【5】异步处理
+- 文件监听在独立线程
+- 不阻塞主 UI 线程
+
+
+═══════════════════════════════════════════════════════════════════════════════
+五、关键技术难点与解决方案
+═══════════════════════════════════════════════════════════════════════════════
+
+【难点 1】无边框窗口的白边问题
+原因：Qt 默认窗口背景为白色，透明属性未完全生效
+解决：
+- 设置 WA_TranslucentBackground
+- 显式设置 background: transparent
+- 外层布局边距设为 0
+
+【难点 2】拖拽与点击的区分
+原因：鼠标按下和释放位置可能有微小偏移
+解决：
+- 记录按下时的位置
+- 释放时比较位置差异
+- 差异小于阈值视为点击
+
+【难点 3】右下角缩放与拖拽冲突
+原因：两者都监听鼠标事件
+解决：
+- 优先判断是否在缩放热区
+- 使用状态标志区分当前模式
+- mouseMoveEvent 中根据状态分别处理
+
+【难点 4】多日期数据聚合效率
+原因：7天数据需要遍历多个目录和文件
+解决：
+- 使用 Counter 高效统计
+- 只提取必要字段
+- 限制返回数量（Top N）
+
+【难点 5】JSONL 格式兼容性
+原因：不同版本 logger 可能字段不同
+解决：
+- 使用 .get() 而非直接访问
+- 同时检查 payload 和顶层字段
+- 提供默认值
+
+
+═══════════════════════════════════════════════════════════════════════════════
+六、扩展性设计
+═══════════════════════════════════════════════════════════════════════════════
+
+【1】新增事件类型
+- 在 parser.py 中添加提取逻辑
+- 在 UI 组件中添加显示逻辑
+- 无需修改核心架构
+
+【2】新增视图
+- 创建新的 Widget 组件
+- 添加到 StackedWidget
+- 在导航栏添加按钮
+
+【3】自定义样式
+- 修改 setStyleSheet() 调用
+- 支持主题切换（预留接口）
+
+【4】插件化
+- 预留 plugin 目录
+- 通过配置文件加载插件
+- 插件可注册自定义事件类型和视图
+
+
+═══════════════════════════════════════════════════════════════════════════════
+七、安全与隐私
+═══════════════════════════════════════════════════════════════════════════════
+
+【1】本地存储
+- 所有数据存储在本地
+- 无网络请求
+- 无数据上传
+
+【2】敏感信息
+- .gitignore 排除日志目录
+- 配置文件可排除敏感路径
+- 建议使用相对路径
+
+【3】权限控制
+- 只读取配置的日志目录
+- 不修改日志文件
+- 不执行外部命令（除打开文件）
+
+
+═══════════════════════════════════════════════════════════════════════════════
+八、测试与调试
+═══════════════════════════════════════════════════════════════════════════════
+
+【调试技巧】
+1. 打印日志：
+   ```python
+   print(f"[DEBUG] projects: {len(projects)}")
+   ```
+
+2. Qt 调试：
+   ```python
+   QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+   ```
+
+3. 文件监听调试：
+   ```python
+   def on_change():
+       print(f"[WATCH] File changed at {datetime.now()}")
+   ```
+
+【常见问题排查】
+- 显示空白：检查 store_path 是否正确
+- 不刷新：检查 watchdog 是否启动
+- 样式异常：检查 QSS 语法
+- 崩溃：检查文件编码（UTF-8）
+
+
+═══════════════════════════════════════════════════════════════════════════════
+九、依赖版本与兼容性
+═══════════════════════════════════════════════════════════════════════════════
+
+【Python 版本】
+- 最低：3.8
+- 推荐：3.10+
+- 测试：3.10, 3.11
+
+【依赖版本】
+- PySide6 >= 6.6.0
+- watchdog >= 3.0.0
+- markdown >= 3.5.0
+
+【操作系统】
+- Windows 10/11 ✓
+- macOS 12+ ✓
+- Linux (Ubuntu 20.04+) ✓
+
+【已知限制】
+- Windows 7 不支持（Qt 限制）
+- 需要桌面环境（不支持 SSH 远程）
+
+
+═══════════════════════════════════════════════════════════════════════════════
+十、未来优化方向
+═══════════════════════════════════════════════════════════════════════════════
+
+【功能增强】
+- [ ] 搜索功能（全文检索）
+- [ ] 导出报告（PDF/HTML）
+- [ ] 数据可视化（图表）
+- [ ] 快捷键支持
+- [ ] 多语言支持
+
+【性能优化】
+- [ ] 数据库缓存（SQLite）
+- [ ] 虚拟列表（大数据量）
+- [ ] 增量解析（只读新增部分）
+
+【用户体验】
+- [ ] 主题切换（亮色/暗色）
+- [ ] 字体大小调整
+- [ ] 窗口位置记忆
+- [ ] 拖拽排序
+
+【技术升级】
+- [ ] 异步 IO（asyncio）
+- [ ] 类型注解完善
+- [ ] 单元测试覆盖
+- [ ] CI/CD 集成
+
+
+═══════════════════════════════════════════════════════════════════════════════
+十一、技术选型理由
+═══════════════════════════════════════════════════════════════════════════════
+
+【为什么选 PySide6？】
+- 跨平台，一套代码多端运行
+- 成熟稳定，Qt 生态完善
+- Python 原生，开发效率高
+- 支持复杂 UI，可定制性强
+
+【为什么选 JSONL？】
+- 支持追加写入，无需重写整个文件
+- 逐行解析，内存占用低
+- 结构化数据，易于查询
+- 人类可读，便于调试
+
+【为什么选 watchdog？】
+- 跨平台文件监听
+- 事件驱动，无需轮询
+- 性能优秀，资源占用低
+- API 简洁，易于集成
+
+【为什么不用 Electron？】
+- Python 生态更适合数据处理
+- 内存占用更低
+- 启动速度更快
+- 无需打包 Chromium
+
+
+═══════════════════════════════════════════════════════════════════════════════
+十二、开发规范
+═══════════════════════════════════════════════════════════════════════════════
+
+【代码风格】
+- 遵循 PEP 8
+- 类型注解（Type Hints）
+- 文档字符串（Docstrings）
+
+【命名规范】
+- 类名：PascalCase
+- 函数/变量：snake_case
+- 常量：UPPER_CASE
+- 私有方法：_leading_underscore
+
+【注释规范】
+- 复杂逻辑必须注释
+- 公共 API 必须有文档字符串
+- TODO 标记待办事项
+
+【Git 提交规范】
+- feat: 新功能
+- fix: 修复 bug
+- docs: 文档更新
+- style: 代码格式
+- refactor: 重构
+- test: 测试
+- chore: 构建/工具
+
+
+═══════════════════════════════════════════════════════════════════════════════
+总结
+═══════════════════════════════════════════════════════════════════════════════
+
+本项目综合运用了以下核心技术：
+1. PySide6 GUI 编程（无边框窗口、信号槽、样式系统）
+2. 文件系统监听（watchdog）
+3. JSONL 数据解析与聚合
+4. 多视图切换（StackedWidget）
+5. 自定义拖拽与缩放
+6. 跨平台兼容性处理
+7. 配置管理与持久化
+8. 性能优化（懒加载、增量更新）
+
+通过模块化设计和松耦合架构，实现了一个高效、易用、可扩展的桌面日志监控工具。

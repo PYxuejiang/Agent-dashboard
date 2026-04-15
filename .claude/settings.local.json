@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p D:/PyCharm_AI/Dai_journal)",
+      "Bash(mkdir -p D:/PyCharm_AI/Dai_journalstore)",
+      "Bash(mkdir -p D:/PyCharm_AI/dashboard/ui)",
+      "Bash(grep -h '\"type\": \"file_change\"' \"D:/ai_journal/store/ptm_gnn_seq/2026-04-14\"/*.jsonl)",
+      "Bash(grep -h '\"type\":' \"D:/ai_journal/store/ptm_gnn_seq/2026-04-14\"/*.jsonl)",
+      "Bash(python -c \"import sys, json; [print\\(json.loads\\(line\\).get\\('type'\\)\\) for line in sys.stdin if line.strip\\(\\)]\")"
+    ]
+  }
+}
